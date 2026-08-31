@@ -55,7 +55,11 @@ pub fn main(init: std.process.Init) !void {
     const here = try std.process.currentPathAlloc(io, gpa);
     const world = try cwd.realPathFileAlloc(io, world_dir orelse "../world", gpa);
     const dest = try std.fs.path.resolve(gpa, &.{ here, at orelse try std.fs.path.join(gpa, &.{ world, "..", game }) });
-    const back = try std.fs.path.relative(gpa, here, null, dest, world);
+    const native = try std.fs.path.relative(gpa, here, null, dest, world);
+    // That path is written into a .zon string, where a backslash is an escape: on
+    // windows `..\..\world` would not parse. Zig's build system takes forward slashes
+    // on every platform, so that is what goes in.
+    const back = try std.mem.replaceOwned(u8, gpa, native, "\\", "/");
 
     if (cwd.access(io, dest, .{})) |_| {
         std.debug.print("{s} is already there; nothing was written\n", .{dest});

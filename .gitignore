@@ -6,7 +6,4 @@ zig-out
 # build.zig.zon, and never committed.
 zig-pkg
 
-# Prebuilt libraries fetched for a platform, not source.
-vendors
-
 save.bin

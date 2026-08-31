@@ -22,7 +22,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    furnish(b, module, target, physics, options);
+    furnish(b, module, target, optimize, physics, options);
 
     // Every test block reachable from src/tests.zig, built the way the library is.
     const tests = b.addTest(.{
@@ -34,7 +34,7 @@ pub fn build(b: *std.Build) void {
         }),
         .use_llvm = true,
     });
-    furnish(b, tests.root_module, target, physics, options);
+    furnish(b, tests.root_module, target, optimize, physics, options);
     const test_step = b.step("test", "run the tests");
     test_step.dependOn(&b.addRunArtifact(tests).step);
 
@@ -64,26 +64,26 @@ fn furnish(
     b: *std.Build,
     module: *std.Build.Module,
     target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
     physics: bool,
     options: *std.Build.Step.Options,
 ) void {
-    // raylib.h, raymath.h, rlgl.h and box3d's headers all live here.
+    // raylib, built from source for whatever target we are on rather than taken from
+    // the system or from a prebuilt binary dropped in by hand. Its own build.zig links
+    // what the platform needs — opengl32, gdi32 and winmm on windows, X11 or wayland
+    // on linux — so nothing here has to name them, and a cross build gets a raylib
+    // built for where it is going. raylib.h, raymath.h and rlgl.h come with the
+    // library, so the headers always match the code they describe.
+    const raylib = b.dependency("raylib", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    module.linkLibrary(raylib.artifact("raylib"));
+
+    // box3d's headers, reached as "box3d/x.h".
     module.addIncludePath(b.path("include/"));
     module.addOptions("build_options", options);
     if (physics) addBox3dSources(b, module);
-
-    if (target.result.os.tag == .windows) {
-        // A mingw build of raylib, dropped into vendors/ (which is ignored by git).
-        module.addObjectFile(b.path("vendors/libraylib.a"));
-        module.linkSystemLibrary("winmm", .{});
-        module.linkSystemLibrary("opengl32", .{});
-        module.linkSystemLibrary("gdi32", .{});
-        module.linkSystemLibrary("shell32", .{});
-        module.linkSystemLibrary("user32", .{});
-    } else {
-        // Elsewhere raylib is the system's own: the distribution's shared library.
-        module.linkSystemLibrary("raylib", .{});
-    }
 }
 
 /// Box3D built from source rather than linked as a prebuilt library, so both halves

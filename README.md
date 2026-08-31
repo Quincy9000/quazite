@@ -3,8 +3,8 @@
 A small game framework in Zig over raylib: an ECS with plugins, systems, generational
 entity ids and typed resources; saves; input by name with controller support; meshes,
 lighting, post effects, audio, noise and tweens; and box3d physics when it is built
-in. Zig 0.16, raylib 6.0. The engine part was lifted out of a survival game; the rest
-was built to be taken or left.
+in. Zig 0.16, raylib 6 (pinned in `build.zig.zon`). The engine part was lifted out of a
+survival game; the rest was built to be taken or left.
 
 `template/` is a game made with it — a grid, a camera, a light, nothing in the world
 yet — and what a new game is stamped from:
@@ -182,16 +182,18 @@ zig build test -Dphysics=true   # with box3d: drops a crate, walks a character i
 
 There is no executable here; run `../template`.
 
-## What is vendored here
+## Other people's code
 
-`include/` carries two other people's libraries, both under permissive licences and
-both unmodified:
+Two libraries, both under permissive licences and neither a fork, reached two
+different ways:
 
-- **raylib** (`raylib.h`, `raymath.h`, `rlgl.h`) — zlib/libpng licence,
-  © Ramon Santamaria ([@raysan5](https://github.com/raysan5/raylib)). Everything here
-  draws through it.
-- **box3d** (`box3d/`) — MIT licence, © Erin Catto
-  ([box3d](https://github.com/erincatto/box3d)). Built only with `-Dphysics=true`;
-  every file keeps its own SPDX header.
-
-Neither is a fork. They are here so that a clone builds without fetching anything.
+- **raylib** — zlib/libpng licence, © Ramon Santamaria
+  ([@raysan5](https://github.com/raysan5/raylib)). Everything here draws through it. It
+  is a package dependency, pinned by url and hash in `build.zig.zon` and built from
+  source for whatever target the build is for. Its own `build.zig` names the platform
+  libraries — opengl32, gdi32 and winmm on windows, X11 or wayland on linux, the Cocoa
+  frameworks on macOS — so a clone builds the same way on every host, and nothing has
+  to be dropped in by hand.
+- **box3d** (`include/box3d/`) — MIT licence, © Erin Catto
+  ([box3d](https://github.com/erincatto/box3d)). Vendored unmodified, compiled in only
+  with `-Dphysics=true`; every file keeps its own SPDX header.

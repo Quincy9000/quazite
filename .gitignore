@@ -1,0 +1,8 @@
+# What the compiler leaves behind.
+.zig-cache
+zig-out
+
+# Prebuilt libraries fetched for a platform, not source.
+vendors
+
+save.bin

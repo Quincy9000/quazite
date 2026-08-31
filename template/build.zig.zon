@@ -1,0 +1,16 @@
+.{
+    .name = .template,
+    .version = "0.1.0",
+    .fingerprint = 0x97601f834bf199ab,
+    .minimum_zig_version = "0.16.0",
+    .dependencies = .{
+        // The framework, next door. A published one is a `.url` and a `.hash` instead,
+        // written by `zig fetch --save <url>`.
+        .world = .{ .path = ".." },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}

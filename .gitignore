@@ -1,6 +1,10 @@
 # What the compiler leaves behind.
 .zig-cache
 zig-out
+# Where zig unpacks fetched dependencies. Source of somebody else's package, kept
+# beside the project rather than in it: fetched again from the url and the hash in
+# build.zig.zon, and never committed.
+zig-pkg
 
 # Prebuilt libraries fetched for a platform, not source.
 vendors

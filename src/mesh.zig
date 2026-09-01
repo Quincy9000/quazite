@@ -31,10 +31,19 @@ pub const Builder = struct {
     positions: std.ArrayList(f32) = .empty,
     normals: std.ArrayList(f32) = .empty,
     uvs: std.ArrayList(f32) = .empty,
+    /// The second set. A picture is laid on a face by a projection, so every face of a
+    /// wall shares its coordinates with its neighbours and none of them is unique — which
+    /// is right for a picture and useless for anything that has to be baked per face, a
+    /// lightmap above all. This is where that unwrap goes when there is one.
+    uv2s: std.ArrayList(f32) = .empty,
     colors: std.ArrayList(u8) = .empty,
     indices: std.ArrayList(u16) = .empty,
     /// What every vertex added from now on is painted. `paint` sets it.
     color: rl.Color = rl.WHITE,
+    /// Where every vertex added from now on falls in the second set. Null — the usual —
+    /// puts it where it falls in the first, which is what a mesh with no second unwrap
+    /// wants: the channel is there and says nothing new.
+    uv2: ?rl.Vector2 = null,
 
     pub const Error = error{ OutOfMemory, TooManyVertices };
 
@@ -46,6 +55,7 @@ pub const Builder = struct {
         b.positions.deinit(b.gpa);
         b.normals.deinit(b.gpa);
         b.uvs.deinit(b.gpa);
+        b.uv2s.deinit(b.gpa);
         b.colors.deinit(b.gpa);
         b.indices.deinit(b.gpa);
     }
@@ -55,6 +65,7 @@ pub const Builder = struct {
         b.positions.clearRetainingCapacity();
         b.normals.clearRetainingCapacity();
         b.uvs.clearRetainingCapacity();
+        b.uv2s.clearRetainingCapacity();
         b.colors.clearRetainingCapacity();
         b.indices.clearRetainingCapacity();
     }
@@ -81,6 +92,8 @@ pub const Builder = struct {
         try b.positions.appendSlice(b.gpa, &.{ at.x, at.y, at.z });
         try b.normals.appendSlice(b.gpa, &.{ normal.x, normal.y, normal.z });
         try b.uvs.appendSlice(b.gpa, &.{ uv.x, uv.y });
+        const second = b.uv2 orelse uv;
+        try b.uv2s.appendSlice(b.gpa, &.{ second.x, second.y });
         try b.colors.appendSlice(b.gpa, &.{ b.color.r, b.color.g, b.color.b, b.color.a });
         return @intCast(index);
     }
@@ -402,6 +415,14 @@ pub const Builder = struct {
         errdefer page.free(normals);
         const uvs = try page.dupe(f32, b.uvs.items);
         errdefer page.free(uvs);
+        const uv2s = try page.dupe(f32, b.uv2s.items);
+        errdefer page.free(uv2s);
+        // Worked out here rather than asked of the caller: a tangent is a fact about the
+        // triangles and their coordinates, and nothing that builds a mesh should have to
+        // remember to produce one.
+        const tangents = try page.alloc(f32, b.vertexCount() * 4);
+        errdefer page.free(tangents);
+        tangentsOf(b.positions.items, b.normals.items, b.uvs.items, b.indices.items, tangents);
         const colors = try page.dupe(u8, b.colors.items);
         errdefer page.free(colors);
         const indices = try page.dupe(u16, b.indices.items);
@@ -413,12 +434,97 @@ pub const Builder = struct {
         raw.vertices = positions.ptr;
         raw.normals = normals.ptr;
         raw.texcoords = uvs.ptr;
+        raw.texcoords2 = uv2s.ptr;
+        raw.tangents = tangents.ptr;
         raw.colors = colors.ptr;
         raw.indices = indices.ptr;
         rl.UploadMesh(&raw, false);
         return .{ .raw = raw, .bounds = b.bounds() };
     }
 };
+
+/// A tangent for every vertex: the direction the picture's own x runs in, across the
+/// surface, with a fourth number saying which way its y turns.
+///
+/// This is what a normal map is read in. Without it there is no way to say where "along
+/// the picture" points in the world, so a map full of tilted normals means nothing —
+/// which is why the channel being absent was not a missing feature but a missing
+/// possibility. Nothing samples it yet; the mesh carries it so that something can.
+///
+/// Accumulated per triangle and averaged, then made square to the normal. A triangle
+/// whose coordinates have no area — three vertices on one spot of the picture — says
+/// nothing about direction and is left out; a vertex that no triangle could speak for
+/// gets any direction square to its normal, which is as true as anything else.
+pub fn tangentsOf(positions: []const f32, normals: []const f32, uvs: []const f32, indices: []const u16, out: []f32) void {
+    @memset(out, 0);
+    var at: usize = 0;
+    while (at + 2 < indices.len) : (at += 3) {
+        const i = [3]usize{ indices[at], indices[at + 1], indices[at + 2] };
+        if (i[0] * 3 + 2 >= positions.len or i[1] * 3 + 2 >= positions.len or i[2] * 3 + 2 >= positions.len) continue;
+        const p = [3]rl.Vector3{ vec3At(positions, i[0]), vec3At(positions, i[1]), vec3At(positions, i[2]) };
+        const t = [3]rl.Vector2{ vec2At(uvs, i[0]), vec2At(uvs, i[1]), vec2At(uvs, i[2]) };
+        const e1 = rl.Vector3Subtract(p[1], p[0]);
+        const e2 = rl.Vector3Subtract(p[2], p[0]);
+        const du1 = t[1].x - t[0].x;
+        const dv1 = t[1].y - t[0].y;
+        const du2 = t[2].x - t[0].x;
+        const dv2 = t[2].y - t[0].y;
+        const area = du1 * dv2 - du2 * dv1;
+        if (@abs(area) < 1e-12) continue;
+        const r = 1 / area;
+        const along = rl.Vector3{
+            .x = (e1.x * dv2 - e2.x * dv1) * r,
+            .y = (e1.y * dv2 - e2.y * dv1) * r,
+            .z = (e1.z * dv2 - e2.z * dv1) * r,
+        };
+        for (i) |k| {
+            if (k * 4 + 3 >= out.len) continue;
+            out[k * 4 + 0] += along.x;
+            out[k * 4 + 1] += along.y;
+            out[k * 4 + 2] += along.z;
+        }
+    }
+    var k: usize = 0;
+    while (k * 4 + 3 < out.len) : (k += 1) {
+        const n = if (k * 3 + 2 < normals.len) vec3At(normals, k) else rl.Vector3{ .x = 0, .y = 1, .z = 0 };
+        var along = rl.Vector3{ .x = out[k * 4], .y = out[k * 4 + 1], .z = out[k * 4 + 2] };
+        // Square to the normal: Gram-Schmidt, which is what makes the three axes a frame
+        // rather than three directions that happen to be near one another.
+        along = rl.Vector3Subtract(along, rl.Vector3Scale(n, rl.Vector3DotProduct(n, along)));
+        if (rl.Vector3Length(along) < 1e-8) along = anyAcross(n);
+        along = rl.Vector3Normalize(along);
+        out[k * 4 + 0] = along.x;
+        out[k * 4 + 1] = along.y;
+        out[k * 4 + 2] = along.z;
+        // Right-handed, always: nothing here flips a picture, so the other way never
+        // arises. It is written down rather than assumed because a shader reads it.
+        out[k * 4 + 3] = 1;
+    }
+}
+
+fn vec3At(list: []const f32, i: usize) rl.Vector3 {
+    return .{ .x = list[i * 3], .y = list[i * 3 + 1], .z = list[i * 3 + 2] };
+}
+
+fn vec2At(list: []const f32, i: usize) rl.Vector2 {
+    return .{ .x = list[i * 2], .y = list[i * 2 + 1] };
+}
+
+/// Any direction square to one: for a vertex whose triangles said nothing.
+fn anyAcross(n: rl.Vector3) rl.Vector3 {
+    const away = if (@abs(n.y) < 0.9) rl.Vector3{ .x = 0, .y = 1, .z = 0 } else rl.Vector3{ .x = 1, .y = 0, .z = 0 };
+    return rl.Vector3Normalize(rl.Vector3CrossProduct(away, n));
+}
+
+/// Two tints, one through the other.
+fn mixed(a: rl.Color, b: rl.Color) rl.Color {
+    return .{
+        .r = @intCast(@as(u16, a.r) * @as(u16, b.r) / 255),
+        .g = @intCast(@as(u16, a.g) * @as(u16, b.g) / 255),
+        .b = @intCast(@as(u16, a.b) * @as(u16, b.b) / 255),
+        .a = @intCast(@as(u16, a.a) * @as(u16, b.a) / 255),
+    };
+}
 
 fn faceNormal(a: rl.Vector3, b: rl.Vector3, c: rl.Vector3) rl.Vector3 {
     return rl.Vector3Normalize(rl.Vector3CrossProduct(rl.Vector3Subtract(b, a), rl.Vector3Subtract(c, a)));
@@ -515,12 +621,22 @@ pub const Mesh = struct {
         m.drawWith(transform, tint, null);
     }
 
-    /// The same, wearing a picture. Without one the mesh keeps its own colours, which
-    /// is what the editor wants while it is being built and a game wants for anything
-    /// plain.
+    /// The same, wearing a picture that is already on the card rather than one out of
+    /// `Textures`. For anything holding a texture of its own — a render target, a picture
+    /// made on the spot — which has no id for a material to name.
     pub fn drawWith(m: *const Mesh, transform: rl.Matrix, tint: rl.Color, picture: ?rl.Texture2D) void {
-        var mat = material(picture);
+        var mat = material(.{}, null);
+        mat.maps[rl.MATERIAL_MAP_DIFFUSE].texture = picture orelse blank_texture;
         mat.maps[rl.MATERIAL_MAP_DIFFUSE].color = tint;
+        rl.DrawMesh(m.raw, mat, transform);
+    }
+
+    /// The same, made of something: the one draw everything else goes through.
+    pub fn drawMade(m: *const Mesh, transform: rl.Matrix, tint: rl.Color, made: Material, pictures: ?*const Textures) void {
+        var mat = material(made, pictures);
+        // The model's own tint on top of the material's: one says what the thing is made
+        // of and the other says what is happening to this one of them.
+        mat.maps[rl.MATERIAL_MAP_DIFFUSE].color = mixed(made.tint, tint);
         rl.DrawMesh(m.raw, mat, transform);
     }
 
@@ -532,8 +648,8 @@ pub const Mesh = struct {
         m.draw(matrixOf(at, rotation, scaling), tint);
     }
 
-    pub fn drawPosedWith(m: *const Mesh, at: rl.Vector3, rotation: rl.Quaternion, scaling: rl.Vector3, tint: rl.Color, picture: ?rl.Texture2D) void {
-        m.drawWith(matrixOf(at, rotation, scaling), tint, picture);
+    pub fn drawPosedMade(m: *const Mesh, at: rl.Vector3, rotation: rl.Quaternion, scaling: rl.Vector3, tint: rl.Color, made: Material, pictures: ?*const Textures) void {
+        m.drawMade(matrixOf(at, rotation, scaling), tint, made, pictures);
     }
 
     /// The GPU's copy let go of, and the CPU's with it. By hand rather than through
@@ -553,6 +669,8 @@ pub const Mesh = struct {
         if (m.raw.vertices != null) page.free(m.raw.vertices[0 .. verts * 3]);
         if (m.raw.normals != null) page.free(m.raw.normals[0 .. verts * 3]);
         if (m.raw.texcoords != null) page.free(m.raw.texcoords[0 .. verts * 2]);
+        if (m.raw.texcoords2 != null) page.free(m.raw.texcoords2[0 .. verts * 2]);
+        if (m.raw.tangents != null) page.free(m.raw.tangents[0 .. verts * 4]);
         if (m.raw.colors != null) page.free(m.raw.colors[0 .. verts * 4]);
         if (m.raw.indices != null) page.free(m.raw.indices[0 .. tris * 3]);
         m.raw = std.mem.zeroes(rl.Mesh);
@@ -589,18 +707,32 @@ pub var default_ambient: f32 = 0.55;
 /// that material is made. Wearing it leaves a mesh its own colours.
 var blank_texture: rl.Texture2D = undefined;
 
-fn material(picture: ?rl.Texture2D) rl.Material {
+/// The raylib material one of ours comes out as, ready to draw with.
+///
+/// Every map is written every time, never only the ones this material has. `maps` is a
+/// pointer into the one material every mesh shares, so a map left alone is a map still
+/// holding whatever the last mesh put there — which is how every bare thing in the world
+/// once came out wearing whatever had been drawn before it.
+fn material(made: Material, pictures: ?*const Textures) rl.Material {
     if (default_material == null) {
         default_material = rl.LoadMaterialDefault();
         blank_texture = default_material.?.maps[rl.MATERIAL_MAP_DIFFUSE].texture;
     }
     var mat = default_material.?;
     if (shader) |lent| mat.shader = lent;
-    // Set every time, never only when there is one to set. `maps` is a pointer into the
-    // one material every mesh shares, so writing a picture there leaves it there: a mesh
-    // wearing none, drawn after one that was, would keep the other's picture and every
-    // bare thing in the world would come out wearing whatever was drawn before it.
-    mat.maps[rl.MATERIAL_MAP_DIFFUSE].texture = picture orelse blank_texture;
+    const look = struct {
+        fn up(ts: ?*const Textures, id: ?TextureId, blank: rl.Texture2D) rl.Texture2D {
+            const which = id orelse return blank;
+            const from = ts orelse return blank;
+            return from.get(which);
+        }
+    }.up;
+    mat.maps[rl.MATERIAL_MAP_DIFFUSE].texture = look(pictures, made.diffuse, blank_texture);
+    mat.maps[rl.MATERIAL_MAP_NORMAL].texture = look(pictures, made.normal, std.mem.zeroes(rl.Texture2D));
+    mat.maps[rl.MATERIAL_MAP_ROUGHNESS].texture = look(pictures, made.roughness, std.mem.zeroes(rl.Texture2D));
+    mat.maps[rl.MATERIAL_MAP_EMISSION].texture = look(pictures, made.emissive, std.mem.zeroes(rl.Texture2D));
+    mat.maps[rl.MATERIAL_MAP_DIFFUSE].color = made.tint;
+    mat.maps[rl.MATERIAL_MAP_SPECULAR].value = made.shine;
     return mat;
 }
 
@@ -610,10 +742,33 @@ pub const Meshes = struct {
     gpa: std.mem.Allocator,
     list: std.ArrayList(Mesh) = .empty,
     names: std.StringHashMapUnmanaged(MeshId) = .empty,
+    /// Slots let go of and free to be handed out again.
+    ///
+    /// Without this the table only ever grows. `discard` frees the card's buffers but the
+    /// slot stays, so anything that lets a thing go and makes it again — an undo, a level
+    /// load, both of which delete every brush and spawn it afresh — leaves one dead slot
+    /// per mesh, for good. Forty undos of a two thousand brush level is eighty thousand of
+    /// them. Editing does not have this problem because `remesh` uses `replace`, which
+    /// keeps the id; this is for the paths that cannot.
+    free: std.ArrayList(MeshId) = .empty,
+
+    /// Whether a slot holds nothing: `Mesh.deinit` zeroes what it let go of, so a slot
+    /// says for itself whether it is spent. No second array to keep in step.
+    fn spent(m: Mesh) bool {
+        return m.raw.vertexCount == 0 and m.raw.vertices == null;
+    }
 
     /// Keeps a mesh; its id is what a `Model` holds. Let go of with the rest at the
     /// end.
     pub fn add(ms: *Meshes, m: Mesh) !MeshId {
+        while (ms.free.pop()) |id| {
+            // A slot that was handed back but has since been filled by `replace` is no
+            // longer free; it is dropped from the list rather than handed out.
+            if (id < ms.list.items.len and spent(ms.list.items[id])) {
+                ms.list.items[id] = m;
+                return id;
+            }
+        }
         try ms.list.append(ms.gpa, m);
         return @intCast(ms.list.items.len - 1);
     }
@@ -631,7 +786,28 @@ pub const Meshes = struct {
     /// thing deleted, whose mesh would otherwise sit on the card until the end.
     pub fn discard(ms: *Meshes, id: MeshId) void {
         const m = ms.get(id) orelse return;
+        // Already spent: nothing to let go of, and nothing to hand back twice — handing
+        // the same slot back twice would hand it out twice, to two things at once.
+        if (spent(m.*)) return;
         m.deinit();
+        if (ms.namedAt(id)) return;
+        ms.free.append(ms.gpa, id) catch {
+            // The slot is still let go of; it simply will not be reused. Out of memory is
+            // not a reason to lose a mesh.
+        };
+    }
+
+    /// Whether a name points at this slot. A named mesh is one somebody looks up by name
+    /// rather than holds the id of, so its slot is never handed out again — the name
+    /// would then answer with whatever landed there. The map holds the framework's own
+    /// built-in shapes and little else, and is empty in a game that names none.
+    fn namedAt(ms: *const Meshes, id: MeshId) bool {
+        if (ms.names.count() == 0) return false;
+        var over = ms.names.valueIterator();
+        while (over.next()) |at| {
+            if (at.* == id) return true;
+        }
+        return false;
     }
 
     /// A mesh made again in place of one kept — a thing edited — so every `Model`
@@ -655,6 +831,8 @@ pub const Meshes = struct {
         for (ms.list.items) |*m| m.deinit();
         ms.list.deinit(ms.gpa);
         ms.list = .empty;
+        ms.free.deinit(ms.gpa);
+        ms.free = .empty;
         var keys = ms.names.keyIterator();
         while (keys.next()) |key| ms.gpa.free(key.*);
         ms.names.deinit(ms.gpa);
@@ -664,13 +842,113 @@ pub const Meshes = struct {
 
 /// What an entity carries to be drawn with a mesh from `Meshes`, where the entity's
 /// `position` is.
+pub const MaterialId = u32;
+
+/// The material every mesh wears until it is given another: no pictures at all, so a
+/// mesh keeps its own colours. Always id nought.
+pub const plain_material: MaterialId = 0;
+
+/// What a surface is made of.
+///
+/// A picture is one of the things it says and the least of them. A `Model` used to name a
+/// bare texture and nothing else, so there was no room anywhere in the framework for a
+/// surface that had a shape under its picture, gave off light of its own, or was rougher
+/// in one place than another — not "unimplemented", but unsayable. This is the room.
+///
+/// The maps beyond the first are carried but not yet read: the lit shader samples the
+/// diffuse and nothing more. That is one string away now, where before it was a rewrite
+/// of the vertex format, the model, the draw path and the shader all at once.
+pub const Material = struct {
+    /// The picture. None leaves the surface its vertex colours.
+    diffuse: ?TextureId = null,
+    /// The shape under the picture, per texel: which way the surface really turns. Read
+    /// through the tangent frame the mesh carries — see `tangentsOf`.
+    normal: ?TextureId = null,
+    /// How rough, and how much like metal, packed the way glTF packs them.
+    roughness: ?TextureId = null,
+    /// What it gives off on its own, whatever the light is doing.
+    emissive: ?TextureId = null,
+    /// Multiplied into whatever the picture and the vertex colours say.
+    tint: rl.Color = rl.WHITE,
+    /// How sharply the light comes back off it.
+    shine: f32 = 0,
+    /// Below this much alpha the texel is thrown away rather than blended. Nought blends,
+    /// which is what anything solid wants.
+    cutout: f32 = 0,
+    /// What it is called, for a level to name it by rather than by a number.
+    name: [47:0]u8 = @splat(0),
+
+    pub fn called(m: *const Material) []const u8 {
+        return std.mem.sliceTo(&m.name, 0);
+    }
+};
+
+/// The materials there are, by id. A `Model` holds one of these numbers.
+pub const Materials = struct {
+    gpa: std.mem.Allocator,
+    list: std.ArrayList(Material) = .empty,
+
+    /// What id nought is, whether or not anyone has made it.
+    fn bare() Material {
+        return .{};
+    }
+
+    pub fn get(ms: *const Materials, id: MaterialId) Material {
+        if (id >= ms.list.items.len) return bare();
+        return ms.list.items[id];
+    }
+
+    /// The one to change, if there is one to change.
+    pub fn at(ms: *Materials, id: MaterialId) ?*Material {
+        if (id >= ms.list.items.len) return null;
+        return &ms.list.items[id];
+    }
+
+    pub fn add(ms: *Materials, made: Material) !MaterialId {
+        try ms.ensurePlain();
+        try ms.list.append(ms.gpa, made);
+        return @intCast(ms.list.items.len - 1);
+    }
+
+    fn ensurePlain(ms: *Materials) !void {
+        if (ms.list.items.len == 0) try ms.list.append(ms.gpa, bare());
+    }
+
+    /// The plain material for one picture: nothing but a diffuse map. Made the first time
+    /// it is asked for and found again after, so a level of four hundred brushes wearing
+    /// twelve pictures has twelve materials and not four hundred.
+    ///
+    /// This is the bridge for anything that thinks in pictures rather than in materials —
+    /// an editor whose user picks an image out of a folder. It gives that a material id
+    /// without asking it to know what a material is.
+    pub fn forTexture(ms: *Materials, picture: ?TextureId) MaterialId {
+        ms.ensurePlain() catch @panic("out of memory");
+        const want = picture orelse return plain_material;
+        for (ms.list.items, 0..) |made, i| {
+            if (made.diffuse != null and made.diffuse.? == want and
+                made.normal == null and made.roughness == null and made.emissive == null) return @intCast(i);
+        }
+        return ms.add(.{ .diffuse = want }) catch @panic("out of memory");
+    }
+
+    pub fn count(ms: *const Materials) usize {
+        return ms.list.items.len;
+    }
+
+    fn unloadAll(ms: *Materials) void {
+        ms.list.deinit(ms.gpa);
+        ms.list = .empty;
+    }
+};
+
 pub const Model = struct {
     mesh: MeshId,
     rotation: rl.Quaternion = identity,
     scale: rl.Vector3 = ones,
     tint: rl.Color = rl.WHITE,
-    /// The picture it wears, out of `Textures`. None leaves it its own colours.
-    texture: ?TextureId = null,
+    /// What it is made of, out of `Materials`. Nought is plain, which leaves it its own
+    /// colours.
+    material: MaterialId = plain_material,
     /// Whether it is drawn at all. For something taken out of sight for a moment and
     /// put back — a wall an editor is seeing past — where letting the mesh go and
     /// building it again every frame would be far dearer than not drawing it. A fully
@@ -713,6 +991,8 @@ pub fn missing() rl.Texture2D {
 /// of them at the start and asks for one by name; whatever holds an id — a `Model`, a
 /// brush's face — holds it for as long as the world does.
 pub const Textures = struct {
+    /// A picture by name, and the picture itself once there is one. A texture id of
+    /// nought is a name with nothing behind it yet — see `reserve`.
     const Kept = struct { name: []u8, texture: rl.Texture2D };
 
     gpa: std.mem.Allocator,
@@ -727,19 +1007,50 @@ pub const Textures = struct {
         // it is taken a copy of at once rather than held on to across the loading.
         const label = try ts.gpa.dupe(u8, std.mem.span(rl.GetFileNameWithoutExt(path)));
         errdefer ts.gpa.free(label);
-        if (ts.by_name.get(label)) |had| {
+        const already = ts.by_name.get(label);
+        if (already) |had| {
             ts.gpa.free(label);
-            return had;
+            // A name someone asked after before the file turned up: the entry stands, and
+            // this fills it. Everything already pointing at that id starts drawing the
+            // picture without knowing anything happened.
+            if (ts.list.items[had].texture.id != 0) return had;
         }
         const texture = rl.LoadTexture(path);
-        if (texture.id == 0) return error.TextureNotLoaded;
+        if (texture.id == 0) {
+            if (already == null) ts.gpa.free(label);
+            return error.TextureNotLoaded;
+        }
         // A wall wants to repeat, and to be smoothed between its own texels and nothing
         // else. No mip levels are made: raylib's bilinear on a mipmapped texture is
         // LINEAR_MIP_NEAREST, which still blends between levels and still reads soft —
         // plain bilinear is only plain when there is nothing to mip to.
         rl.SetTextureFilter(texture, rl.TEXTURE_FILTER_BILINEAR);
         rl.SetTextureWrap(texture, rl.TEXTURE_WRAP_REPEAT);
+        if (already) |had| {
+            ts.list.items[had].texture = texture;
+            return had;
+        }
         try ts.list.append(ts.gpa, .{ .name = label, .texture = texture });
+        const id: TextureId = @intCast(ts.list.items.len - 1);
+        try ts.by_name.put(ts.gpa, label, id);
+        return id;
+    }
+
+    /// An id for a name whose file is not here — yet, or at all.
+    ///
+    /// A level names its pictures, because a number is a place in a folder and the folder
+    /// changes. Opening one somewhere the pictures are not, the names have to go
+    /// somewhere: dropping them and keeping "there is no picture here" loses the level's
+    /// own word for what belongs on that wall, and saving afterwards writes the loss to
+    /// disk. So a name with nothing behind it is still an entry, with the name it was
+    /// asked for and no picture. It draws the check, it saves back out as itself, and if
+    /// the file turns up later `load` fills the entry in place and every face wearing it
+    /// starts drawing it.
+    pub fn reserve(ts: *Textures, name: []const u8) !TextureId {
+        if (ts.by_name.get(name)) |had| return had;
+        const label = try ts.gpa.dupe(u8, name);
+        errdefer ts.gpa.free(label);
+        try ts.list.append(ts.gpa, .{ .name = label, .texture = std.mem.zeroes(rl.Texture2D) });
         const id: TextureId = @intCast(ts.list.items.len - 1);
         try ts.by_name.put(ts.gpa, label, id);
         return id;
@@ -820,18 +1131,26 @@ pub const Textures = struct {
     /// wall, loudly, instead of quietly looking finished.
     pub fn get(ts: *const Textures, id: TextureId) rl.Texture2D {
         if (id >= ts.list.items.len) return missing();
-        return ts.list.items[id].texture;
+        const kept = ts.list.items[id].texture;
+        return if (kept.id == 0) missing() else kept;
     }
 
     /// The same, but honest about it: null where there is no such picture, for whoever
     /// needs to know rather than to draw.
     pub fn lookup(ts: *const Textures, id: TextureId) ?rl.Texture2D {
         if (id >= ts.list.items.len) return null;
-        return ts.list.items[id].texture;
+        const kept = ts.list.items[id].texture;
+        return if (kept.id == 0) null else kept;
     }
 
+    /// Whether anything answers to an id at all — a reserved name does.
     pub fn has(ts: *const Textures, id: TextureId) bool {
         return id < ts.list.items.len;
+    }
+
+    /// Whether there is a picture behind the name, rather than only the name.
+    pub fn loaded(ts: *const Textures, id: TextureId) bool {
+        return id < ts.list.items.len and ts.list.items[id].texture.id != 0;
     }
 
     /// What a picture is called, for the readout and for saving a level by name rather
@@ -849,7 +1168,7 @@ pub const Textures = struct {
         if (missing_texture) |made| rl.UnloadTexture(made);
         missing_texture = null;
         for (ts.list.items) |*kept| {
-            rl.UnloadTexture(kept.texture);
+            if (kept.texture.id != 0) rl.UnloadTexture(kept.texture);
             ts.gpa.free(kept.name);
         }
         ts.list.deinit(ts.gpa);
@@ -881,6 +1200,7 @@ pub fn Module(comptime Spec: type) type {
         pub fn drawModels(w: *W) void {
             const meshes = w.resource(Meshes);
             const pictures = w.resource(Textures);
+            const materials = w.resource(Materials);
             inline for (comptime components.fieldsOf(Model)) |field| {
                 var walk = w.query(.{ .position, field });
                 while (walk.next()) |entity| {
@@ -888,8 +1208,7 @@ pub fn Module(comptime Spec: type) type {
                     const m = meshes.get(model.mesh) orelse continue;
                     // A mesh let go of draws nothing, and neither does one told not to.
                     if (m.raw.vertexCount == 0 or !model.shown) continue;
-                    const picture = if (model.texture) |id| pictures.get(id) else null;
-                    m.drawPosedWith(entity.position.*, model.rotation, model.scale, model.tint, picture);
+                    m.drawPosedMade(entity.position.*, model.rotation, model.scale, model.tint, materials.get(model.material), pictures);
                 }
             }
         }
@@ -899,6 +1218,7 @@ pub fn Module(comptime Spec: type) type {
         fn close(w: *W) void {
             w.resource(Meshes).unloadAll();
             w.resource(Textures).unloadAll();
+            w.resource(Materials).unloadAll();
             // Unloaded wearing raylib's own shader: a lent one is its lender's to unload.
             if (default_material) |mat| {
                 var own = mat;
@@ -911,6 +1231,7 @@ pub fn Module(comptime Spec: type) type {
         pub fn plugin(w: *W, allocator: std.mem.Allocator) !void {
             _ = try w.insertResource(allocator, Meshes{ .gpa = allocator });
             _ = try w.insertResource(allocator, Textures{ .gpa = allocator });
+            _ = try w.insertResource(allocator, Materials{ .gpa = allocator });
             default_light = config.mesh_light;
             default_ambient = config.mesh_ambient;
             // After the window, whose context the meshes live in; before anything that builds one.
@@ -1030,4 +1351,167 @@ test "a grid is a smooth terrain: shared vertices, normals from the slope" {
         const n = faceNormal(at.of(&b, b.indices.items[t]), at.of(&b, b.indices.items[t + 1]), at.of(&b, b.indices.items[t + 2]));
         try std.testing.expect(n.y > 0);
     }
+}
+
+test "a name with no picture behind it is kept, and filled in if the picture turns up" {
+    const gpa = std.testing.allocator;
+    var ts = Textures{ .gpa = gpa };
+    defer ts.unloadAll();
+
+    // A level names a picture that is not in the folder.
+    const id = try ts.reserve("north_brick");
+    try std.testing.expectEqualStrings("north_brick", ts.nameOf(id));
+    // There is an entry, but nothing behind it: it draws the check and it is not
+    // something the exporter can read pixels off.
+    try std.testing.expect(ts.has(id));
+    try std.testing.expect(!ts.loaded(id));
+    try std.testing.expect(ts.lookup(id) == null);
+
+    // Asking again gives the same id rather than a second entry, so a hundred faces
+    // naming the same absent picture are one reserved name.
+    try std.testing.expectEqual(id, try ts.reserve("north_brick"));
+    try std.testing.expectEqual(@as(usize, 1), ts.count());
+    try std.testing.expectEqual(id, ts.find("north_brick").?);
+
+    // And the name is what saving writes back out — the whole point. Before this, an id
+    // nothing answered to came back from `nameOf` as the word "missing", which went into
+    // the file as though it were the name of a picture.
+    try std.testing.expectEqualStrings("north_brick", ts.nameOf(id));
+    try std.testing.expectEqualStrings("missing", ts.nameOf(no_such_texture));
+}
+
+test "a mesh let go of hands its slot back" {
+    const gpa = std.testing.allocator;
+    var ms = Meshes{ .gpa = gpa };
+    defer ms.unloadAll();
+
+    // A mesh with something to free, so `deinit` does its work and leaves the slot
+    // saying it is spent. Nothing here touches the card.
+    const made = struct {
+        fn one() Mesh {
+            const page = std.heap.page_allocator;
+            const verts = page.alloc(f32, 9) catch unreachable;
+            var raw = std.mem.zeroes(rl.Mesh);
+            raw.vertexCount = 3;
+            raw.vertices = verts.ptr;
+            return .{ .raw = raw, .bounds = std.mem.zeroes(rl.BoundingBox) };
+        }
+    }.one;
+
+    const a = try ms.add(made());
+    const b = try ms.add(made());
+    const c = try ms.add(made());
+    try std.testing.expectEqual(@as(usize, 3), ms.list.items.len);
+
+    // The table used to grow for ever: every undo and every level load deleted its
+    // brushes and made them again, and each one left its slot behind.
+    ms.discard(b);
+    const d = try ms.add(made());
+    try std.testing.expectEqual(b, d);
+    try std.testing.expectEqual(@as(usize, 3), ms.list.items.len);
+
+    // Handing the same slot back twice would hand it out twice, to two things at once.
+    ms.discard(a);
+    ms.discard(a);
+    const e = try ms.add(made());
+    const f = try ms.add(made());
+    try std.testing.expectEqual(a, e);
+    try std.testing.expect(f != e);
+    try std.testing.expectEqual(@as(usize, 4), ms.list.items.len);
+    _ = c;
+}
+
+test "a named mesh keeps its slot even when it is let go of" {
+    const gpa = std.testing.allocator;
+    var ms = Meshes{ .gpa = gpa };
+    defer ms.unloadAll();
+    const blank = Mesh{ .raw = blk: {
+        const page = std.heap.page_allocator;
+        const verts = page.alloc(f32, 3) catch unreachable;
+        var raw = std.mem.zeroes(rl.Mesh);
+        raw.vertexCount = 1;
+        raw.vertices = verts.ptr;
+        break :blk raw;
+    }, .bounds = std.mem.zeroes(rl.BoundingBox) };
+
+    const id = try ms.name("cube", blank);
+    ms.discard(id);
+    // The name still points here, so the slot is not handed out again — it would answer
+    // "cube" with whatever landed in it.
+    try std.testing.expectEqual(@as(usize, 0), ms.free.items.len);
+    try std.testing.expectEqual(id, ms.find("cube").?);
+}
+
+test "a tangent points along the picture's own x, across the surface" {
+    // One quad in the xz plane, facing up, with the picture's x along world +x and its y
+    // along world +z. The tangent should come out as world +x.
+    const positions = [_]f32{ 0, 0, 0, 1, 0, 0, 1, 0, 1, 0, 0, 1 };
+    const normals = [_]f32{ 0, 1, 0, 0, 1, 0, 0, 1, 0, 0, 1, 0 };
+    const uvs = [_]f32{ 0, 0, 1, 0, 1, 1, 0, 1 };
+    const indices = [_]u16{ 0, 1, 2, 0, 2, 3 };
+    var out: [16]f32 = undefined;
+    tangentsOf(&positions, &normals, &uvs, &indices, &out);
+    for (0..4) |k| {
+        try std.testing.expectApproxEqAbs(@as(f32, 1), out[k * 4 + 0], 1e-4);
+        try std.testing.expectApproxEqAbs(@as(f32, 0), out[k * 4 + 1], 1e-4);
+        try std.testing.expectApproxEqAbs(@as(f32, 0), out[k * 4 + 2], 1e-4);
+        try std.testing.expectEqual(@as(f32, 1), out[k * 4 + 3]);
+    }
+
+    // The picture turned a quarter: its x now runs along world +z, and the tangent turns
+    // with it. This is the whole point — the tangent is about the coordinates, not about
+    // the triangle.
+    const turned = [_]f32{ 0, 0, 0, 1, 1, 1, 1, 0 };
+    tangentsOf(&positions, &normals, &turned, &indices, &out);
+    for (0..4) |k| {
+        try std.testing.expectApproxEqAbs(@as(f32, 0), out[k * 4 + 0], 1e-4);
+        try std.testing.expectApproxEqAbs(@as(f32, 1), out[k * 4 + 2], 1e-4);
+    }
+}
+
+test "a vertex whose triangles say nothing still gets a frame" {
+    // Every coordinate on one spot: no direction can be read off it. A zero tangent would
+    // make a normal map read as a black hole rather than as flat.
+    const positions = [_]f32{ 0, 0, 0, 1, 0, 0, 1, 0, 1 };
+    const normals = [_]f32{ 0, 1, 0, 0, 1, 0, 0, 1, 0 };
+    const uvs = [_]f32{ 0.5, 0.5, 0.5, 0.5, 0.5, 0.5 };
+    const indices = [_]u16{ 0, 1, 2 };
+    var out: [12]f32 = undefined;
+    tangentsOf(&positions, &normals, &uvs, &indices, &out);
+    for (0..3) |k| {
+        const t = rl.Vector3{ .x = out[k * 4], .y = out[k * 4 + 1], .z = out[k * 4 + 2] };
+        try std.testing.expectApproxEqAbs(@as(f32, 1), rl.Vector3Length(t), 1e-4);
+        // Square to the normal, whichever direction it settled on.
+        try std.testing.expectApproxEqAbs(@as(f32, 0), t.y, 1e-4);
+    }
+}
+
+test "a picture becomes one material, however many things wear it" {
+    const gpa = std.testing.allocator;
+    var ms = Materials{ .gpa = gpa };
+    defer ms.unloadAll();
+
+    // Nought is plain whether or not anyone has made it: a mesh with no material named
+    // still has to draw as something.
+    try std.testing.expect(ms.get(plain_material).diffuse == null);
+    try std.testing.expectEqual(plain_material, ms.forTexture(null));
+
+    const brick = ms.forTexture(7);
+    try std.testing.expect(brick != plain_material);
+    try std.testing.expectEqual(@as(?TextureId, 7), ms.get(brick).diffuse);
+    // Four hundred walls wearing brick are one material, not four hundred.
+    try std.testing.expectEqual(brick, ms.forTexture(7));
+    const slate = ms.forTexture(8);
+    try std.testing.expect(slate != brick);
+    try std.testing.expectEqual(@as(usize, 3), ms.count());
+
+    // A material that says more than a picture is its own, and is never handed back as
+    // the plain one for that picture — otherwise asking for "brick" would quietly give
+    // back somebody's bumpy, glowing brick.
+    const rich = try ms.add(.{ .diffuse = 7, .normal = 9, .shine = 0.5 });
+    try std.testing.expectEqual(brick, ms.forTexture(7));
+    try std.testing.expect(rich != brick);
+    ms.at(rich).?.shine = 0.25;
+    try std.testing.expectEqual(@as(f32, 0.25), ms.get(rich).shine);
+    try std.testing.expect(ms.at(999) == null);
 }

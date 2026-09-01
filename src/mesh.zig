@@ -938,14 +938,23 @@ pub const Materials = struct {
     /// This is the bridge for anything that thinks in pictures rather than in materials —
     /// an editor whose user picks an image out of a folder. It gives that a material id
     /// without asking it to know what a material is.
-    pub fn forTexture(ms: *Materials, picture: ?TextureId) MaterialId {
+    pub fn forTexture(ms: *Materials, picture: ?TextureId, pictures: *const Textures) MaterialId {
         ms.ensurePlain() catch @panic("out of memory");
         const want = picture orelse return plain_material;
+        // The shape under it, if a picture beside it says so. See `Textures.map_suffix`.
+        var shape: ?TextureId = null;
+        var named: [96]u8 = undefined;
+        const stem = pictures.nameOf(want);
+        if (stem.len + Textures.map_suffix.len <= named.len) {
+            @memcpy(named[0..stem.len], stem);
+            @memcpy(named[stem.len..][0..Textures.map_suffix.len], Textures.map_suffix);
+            shape = pictures.find(named[0 .. stem.len + Textures.map_suffix.len]);
+        }
         for (ms.list.items, 0..) |made, i| {
             if (made.diffuse != null and made.diffuse.? == want and
-                made.normal == null and made.roughness == null and made.emissive == null) return @intCast(i);
+                std.meta.eql(made.normal, shape) and made.roughness == null and made.emissive == null) return @intCast(i);
         }
-        return ms.add(.{ .diffuse = want }) catch @panic("out of memory");
+        return ms.add(.{ .diffuse = want, .normal = shape }) catch @panic("out of memory");
     }
 
     pub fn count(ms: *const Materials) usize {
@@ -1163,6 +1172,22 @@ pub const Textures = struct {
     /// Whether anything answers to an id at all — a reserved name does.
     pub fn has(ts: *const Textures, id: TextureId) bool {
         return id < ts.list.items.len;
+    }
+
+    /// What is added to a picture's name to name the shape under it: `brick` is a wall,
+    /// `brick_n` is how that wall's surface turns.
+    ///
+    /// A convention, and the one nearly every tool already uses, so a pack downloaded this
+    /// afternoon works without anything being wired up by hand. It is a default and not a
+    /// rule: it says what a material gets when nobody has said otherwise, and anything
+    /// that assigns a map deliberately overrides it.
+    pub const map_suffix = "_n";
+
+    /// Whether a picture is a map read by a shader rather than something to put on a wall.
+    /// Those should not be offered in a list of pictures to paint with: nobody wants to
+    /// tile a wall with the lilac of a normal map.
+    pub fn isMap(ts: *const Textures, id: TextureId) bool {
+        return std.mem.endsWith(u8, ts.nameOf(id), map_suffix);
     }
 
     /// Whether there is a picture behind the name, rather than only the name.
@@ -1503,31 +1528,45 @@ test "a vertex whose triangles say nothing still gets a frame" {
     }
 }
 
-test "a picture becomes one material, however many things wear it" {
+test "a picture becomes one material, and picks up the shape named beside it" {
     const gpa = std.testing.allocator;
+    var ts = Textures{ .gpa = gpa };
+    defer ts.unloadAll();
     var ms = Materials{ .gpa = gpa };
     defer ms.unloadAll();
+
+    const brick = try ts.reserve("brick");
+    const brick_shape = try ts.reserve("brick" ++ Textures.map_suffix);
+    const slate = try ts.reserve("slate");
 
     // Nought is plain whether or not anyone has made it: a mesh with no material named
     // still has to draw as something.
     try std.testing.expect(ms.get(plain_material).diffuse == null);
-    try std.testing.expectEqual(plain_material, ms.forTexture(null));
+    try std.testing.expectEqual(plain_material, ms.forTexture(null, &ts));
 
-    const brick = ms.forTexture(7);
-    try std.testing.expect(brick != plain_material);
-    try std.testing.expectEqual(@as(?TextureId, 7), ms.get(brick).diffuse);
+    // A picture with a map named after it gets it without anyone wiring anything up.
+    const wall = ms.forTexture(brick, &ts);
+    try std.testing.expectEqual(@as(?TextureId, brick), ms.get(wall).diffuse);
+    try std.testing.expectEqual(@as(?TextureId, brick_shape), ms.get(wall).normal);
+
+    // One without has none, and is not the same material.
+    const floor = ms.forTexture(slate, &ts);
+    try std.testing.expect(ms.get(floor).normal == null);
+    try std.testing.expect(floor != wall);
+
     // Four hundred walls wearing brick are one material, not four hundred.
-    try std.testing.expectEqual(brick, ms.forTexture(7));
-    const slate = ms.forTexture(8);
-    try std.testing.expect(slate != brick);
+    try std.testing.expectEqual(wall, ms.forTexture(brick, &ts));
     try std.testing.expectEqual(@as(usize, 3), ms.count());
 
-    // A material that says more than a picture is its own, and is never handed back as
-    // the plain one for that picture — otherwise asking for "brick" would quietly give
-    // back somebody's bumpy, glowing brick.
-    const rich = try ms.add(.{ .diffuse = 7, .normal = 9, .shine = 0.5 });
-    try std.testing.expectEqual(brick, ms.forTexture(7));
-    try std.testing.expect(rich != brick);
+    // A map is a map, not something to paint with.
+    try std.testing.expect(ts.isMap(brick_shape));
+    try std.testing.expect(!ts.isMap(brick));
+
+    // A material that says more is its own, and is never handed back as the plain one
+    // for that picture — otherwise asking for brick would give somebody's glowing brick.
+    const rich = try ms.add(.{ .diffuse = brick, .normal = brick_shape, .emissive = slate });
+    try std.testing.expectEqual(wall, ms.forTexture(brick, &ts));
+    try std.testing.expect(rich != wall);
     ms.at(rich).?.shine = 0.25;
     try std.testing.expectEqual(@as(f32, 0.25), ms.get(rich).shine);
     try std.testing.expect(ms.at(999) == null);

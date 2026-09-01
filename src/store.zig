@@ -24,13 +24,30 @@ pub fn Store(comptime Rules: type) type {
         const Self = @This();
         const Chunk = std.ArrayListUnmanaged(u8);
 
-        /// The shape of everything the rules can see, folded to one number.
-        pub const version: u32 = blk: {
-            // The shape of an entity is a long string; walking and hashing it takes
-            // more comptime steps than the default allows.
+        /// The container's own format: the layout of the file around the chunks, and
+        /// nothing about what is in them. Set by hand, and bumped only when that layout
+        /// changes.
+        ///
+        /// It was a fingerprint of the whole entity type's field shape, and that guarded
+        /// the wrong thing in both directions. Nothing writes an entity wholesale — a
+        /// save only fires `onSave` and every system writes what it owns — so a field
+        /// added to the entity changed the fingerprint and refused every file ever
+        /// written, against a risk that did not exist. Meanwhile the types that ARE
+        /// written field by field through `put` are the game's own, a grid or a shape
+        /// record, and those are not in the entity's shape at all: a field added to one
+        /// of them changed nothing, and the next load read the old bytes into the new
+        /// layout without a word.
+        ///
+        /// The guard belongs where the risk is: on the chunk, against the type actually
+        /// written into it. See `writerFor`.
+        pub const format: u32 = 1;
+
+        /// One type's field shape folded to a number, for stamping a chunk with the shape
+        /// of what was written into it.
+        pub fn shapeOf(comptime T: type) u32 {
             @setEvalBranchQuota(1_000_000);
-            break :blk std.hash.Fnv1a_32.hash(shape(Rules));
-        };
+            return comptime std.hash.Fnv1a_32.hash(shape(T));
+        }
 
         pub const ParseError = error{ NotASave, OtherVersion, CutShort, OutOfMemory };
 
@@ -61,12 +78,37 @@ pub fn Store(comptime Rules: type) type {
             return .{ .bytes = chunk.items };
         }
 
+        /// The same, stamped with the shape of the type written there. Use this — and its
+        /// reader — for any chunk that puts a struct, an enum or a union of the game's
+        /// own: `put` walks fields positionally and by order alone, so a field added to
+        /// such a type turns every older chunk into nonsense that reads without error.
+        ///
+        /// A chunk of nothing but plain numbers written out by hand needs no stamp, and
+        /// `writer` stays the way to make one. The stamp goes on once, when the chunk is
+        /// made, so a system that writes to the same key twice still stamps it once.
+        pub fn writerFor(store: *Self, key: []const u8, comptime T: type) Writer {
+            const fresh = store.chunks.getIndex(key) == null;
+            const out = store.writer(key);
+            if (fresh) out.put(u32, shapeOf(T));
+            return out;
+        }
+
+        /// What was written under a key by `writerFor`, if it was written from the same
+        /// shape of type. A chunk stamped with another shape reads as absent — which is
+        /// what every caller already does with a chunk that is not there, so a type that
+        /// changes costs that chunk's worth of a level and nothing else.
+        pub fn readerFor(store: *const Self, key: []const u8, comptime T: type) ?Reader {
+            var in = store.reader(key) orelse return null;
+            if (in.get(u32) != shapeOf(T)) return null;
+            return in;
+        }
+
         /// The whole store as one run of bytes for the disk. The caller frees it.
         pub fn serialize(store: *const Self) ![]u8 {
             var out: Chunk = .empty;
             errdefer out.deinit(store.gpa);
             try out.appendSlice(store.gpa, magic);
-            try out.appendSlice(store.gpa, std.mem.asBytes(&version));
+            try out.appendSlice(store.gpa, std.mem.asBytes(&format));
             const count: u32 = @intCast(store.chunks.count());
             try out.appendSlice(store.gpa, std.mem.asBytes(&count));
             for (store.chunks.keys(), store.chunks.values()) |key, chunk| {
@@ -84,7 +126,7 @@ pub fn Store(comptime Rules: type) type {
         pub fn parse(gpa: Allocator, bytes: []const u8) ParseError!Self {
             var in: Reader = .{ .bytes = bytes };
             if (!std.mem.eql(u8, in.take(magic.len), magic)) return error.NotASave;
-            if (in.get(u32) != version) return error.OtherVersion;
+            if (in.get(u32) != format) return error.OtherVersion;
 
             var store: Self = .init(gpa);
             errdefer store.deinit();
@@ -247,4 +289,76 @@ pub fn Store(comptime Rules: type) type {
             }
         }
     };
+}
+
+// ---- tests ----
+
+const TestRules = struct {
+    pub const Entity = struct { position: [3]f32 = .{ 0, 0, 0 } };
+};
+
+test "a chunk written from one shape does not read back as another" {
+    const gpa = std.testing.allocator;
+    const S = Store(TestRules);
+
+    const Grid = struct { origin: [3]f32, step: f32 };
+    const WiderGrid = struct { origin: [3]f32, step: f32, tilt: f32 };
+
+    var out: S = .init(gpa);
+    defer out.deinit();
+    // One chunk stamped with the type it holds, and one plain chunk of bare numbers.
+    const grids = out.writerFor("grids", Grid);
+    grids.put(u32, 1);
+    grids.put(Grid, .{ .origin = .{ 1, 2, 3 }, .step = 0.5 });
+    const notes = out.writer("notes");
+    notes.put(u32, 7);
+
+    const bytes = try out.serialize();
+    defer gpa.free(bytes);
+    var back = try S.parse(gpa, bytes);
+    defer back.deinit();
+
+    // Read back as what it was written as, and the stamp is eaten rather than counted.
+    var same = back.readerFor("grids", Grid).?;
+    try std.testing.expectEqual(@as(u32, 1), same.get(u32));
+    try std.testing.expectEqual(@as(f32, 0.5), same.get(Grid).step);
+
+    // The same bytes asked for as a type with one more field: absent, not nonsense. This
+    // is the whole point — before the stamp this read the old bytes into the new layout
+    // and answered with a grid whose step was whatever followed it in the file.
+    try std.testing.expect(back.readerFor("grids", WiderGrid) == null);
+
+    // A plain chunk is untouched by any of it.
+    var plain = back.reader("notes").?;
+    try std.testing.expectEqual(@as(u32, 7), plain.get(u32));
+}
+
+test "a save is refused by its container format, and not by the shape of the game" {
+    const gpa = std.testing.allocator;
+    const S = Store(TestRules);
+    // A different game, whose entity has nothing to do with this one's.
+    const OtherRules = struct {
+        pub const Entity = struct { position: [3]f32 = .{ 0, 0, 0 }, health: u8 = 0, name: [8]u8 = @splat(0) };
+    };
+    const Other = Store(OtherRules);
+
+    var out: S = .init(gpa);
+    defer out.deinit();
+    out.writer("hello").put(u32, 42);
+    const bytes = try out.serialize();
+    defer gpa.free(bytes);
+
+    // A file written by one game opens in another: what a chunk means is the writing
+    // system's business, and the entity's shape was never the file's to care about.
+    var back = try Other.parse(gpa, bytes);
+    defer back.deinit();
+    var in = back.reader("hello").?;
+    try std.testing.expectEqual(@as(u32, 42), in.get(u32));
+
+    // Nonsense is still refused.
+    try std.testing.expectError(error.NotASave, S.parse(gpa, "not a save at all"));
+    var wrong = try gpa.dupe(u8, bytes);
+    defer gpa.free(wrong);
+    wrong[magic.len] +%= 1;
+    try std.testing.expectError(error.OtherVersion, S.parse(gpa, wrong));
 }

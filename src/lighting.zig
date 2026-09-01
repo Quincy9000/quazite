@@ -95,6 +95,7 @@ const Locations = struct {
     lamp_tint: c_int,
     lamp_reach: c_int,
     lamp_scale: c_int,
+    has_normal: c_int,
 };
 
 const vertex =
@@ -103,6 +104,7 @@ const vertex =
     \\in vec2 vertexTexCoord;
     \\in vec3 vertexNormal;
     \\in vec4 vertexColor;
+    \\in vec4 vertexTangent;
     \\uniform mat4 mvp;
     \\uniform mat4 matModel;
     \\uniform mat4 matNormal;
@@ -110,10 +112,17 @@ const vertex =
     \\out vec2 fragTexCoord;
     \\out vec3 fragNormal;
     \\out vec4 fragColor;
+    \\out vec3 fragTangent;
+    \\out float fragHand;
     \\void main() {
     \\    fragPosition = vec3(matModel * vec4(vertexPosition, 1.0));
     \\    fragTexCoord = vertexTexCoord;
     \\    fragNormal = normalize(vec3(matNormal * vec4(vertexNormal, 0.0)));
+    \\    vec3 rawTangent = vertexTangent.xyz;
+    \\    fragTangent = dot(rawTangent, rawTangent) > 0.0
+    \\                ? normalize(vec3(matNormal * vec4(rawTangent, 0.0)))
+    \\                : vec3(1.0, 0.0, 0.0);
+    \\    fragHand = vertexTangent.w == 0.0 ? 1.0 : vertexTangent.w;
     \\    fragColor = vertexColor;
     \\    gl_Position = mvp * vec4(vertexPosition, 1.0);
     \\}
@@ -125,7 +134,11 @@ const fragment =
     \\in vec2 fragTexCoord;
     \\in vec3 fragNormal;
     \\in vec4 fragColor;
+    \\in vec3 fragTangent;
+    \\in float fragHand;
     \\uniform sampler2D texture0;
+    \\uniform sampler2D normalMap;
+    \\uniform int hasNormalMap;
     \\uniform vec4 colDiffuse;
     \\uniform vec3 lightDir;
     \\uniform vec3 lightColor;
@@ -149,6 +162,12 @@ const fragment =
     \\void main() {
     \\    vec4 base = texture(texture0, fragTexCoord) * colDiffuse * fragColor;
     \\    vec3 normal = normalize(fragNormal);
+    \\    if (hasNormalMap != 0) {
+    \\        vec3 t = normalize(fragTangent - normal * dot(normal, fragTangent));
+    \\        vec3 b = cross(normal, t) * fragHand;
+    \\        vec3 mapped = texture(normalMap, fragTexCoord).rgb * 2.0 - 1.0;
+    \\        normal = normalize(mat3(t, b, normal) * mapped);
+    \\    }
     \\    float diffuse = max(dot(normal, -lightDir), 0.0);
     \\    float shadow = 1.0;
     \\    if (shadowStrength > 0.0) {
@@ -266,7 +285,14 @@ pub fn Module(comptime Spec: type) type {
                 .lamp_tint = rl.GetShaderLocation(l.shader, "lampTint"),
                 .lamp_reach = rl.GetShaderLocation(l.shader, "lampReach"),
                 .lamp_scale = rl.GetShaderLocation(l.shader, "lampScale"),
+                .has_normal = rl.GetShaderLocation(l.shader, "hasNormalMap"),
             };
+            // raylib binds a material's maps by walking them and setting the sampler this
+            // array names for each. Its own default shader has one for every map; ours has
+            // one for the picture and one for the shape under it, so those two are the two
+            // it is told about. A map the shader has no sampler for is bound to a slot and
+            // read by nobody, which costs a bind and no correctness.
+            l.shader.locs[@intCast(rl.SHADER_LOC_MAP_NORMAL)] = rl.GetShaderLocation(l.shader, "normalMap");
             l.map = depthTarget(config.shadow_size);
             var size: c_int = config.shadow_size;
             rl.SetShaderValue(l.shader, l.locs.map_size, &size, rl.SHADER_UNIFORM_INT);
@@ -275,12 +301,14 @@ pub fn Module(comptime Spec: type) type {
 
             // Every mesh draws lit from here on, and none bakes its own light.
             mesh.shader = l.shader;
+            mesh.normal_flag = l.locs.has_normal;
             mesh.lit = true;
         }
 
         fn unload(w: *W) void {
             const l = w.resource(Lighting);
             mesh.shader = null;
+            mesh.normal_flag = -1;
             mesh.lit = false;
             rl.UnloadShader(l.shader);
             rl.UnloadShader(l.depth_shader);
@@ -323,6 +351,7 @@ pub fn Module(comptime Spec: type) type {
 
             l.in_shadow_pass = true;
             mesh.shader = l.depth_shader;
+            mesh.normal_flag = -1;
 
             // The map is about to be drawn into: off the slot it is sampled from.
             rl.rlActiveTextureSlot(map_slot);
@@ -345,6 +374,7 @@ pub fn Module(comptime Spec: type) type {
             rl.EndTextureMode();
             rl.rlSetClipPlanes(config.near_plane, config.far_plane);
             mesh.shader = l.shader;
+            mesh.normal_flag = l.locs.has_normal;
             l.in_shadow_pass = false;
         }
 

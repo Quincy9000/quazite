@@ -693,6 +693,15 @@ var default_material: ?rl.Material = null;
 /// sets it, and takes it back. Null is raylib's own, unlit.
 pub var shader: ?rl.Shader = null;
 
+/// Where the lent shader keeps "this material has a shape under its picture", or -1 when
+/// it has no such uniform. Set beside `shader` by whoever lends one.
+///
+/// It is a flag rather than a test on the map itself because the map is bound to a unit
+/// whatever happens, and a shader that sampled an unbound one would read black — which is
+/// a normal pointing into the surface, not a flat one. Better to say plainly that there
+/// is nothing to read.
+pub var normal_flag: c_int = -1;
+
 /// Whether a light is on the meshes: then the one-liner shapes leave their colours
 /// alone rather than baking a light of their own in.
 pub var lit = false;
@@ -719,7 +728,15 @@ fn material(made: Material, pictures: ?*const Textures) rl.Material {
         blank_texture = default_material.?.maps[rl.MATERIAL_MAP_DIFFUSE].texture;
     }
     var mat = default_material.?;
-    if (shader) |lent| mat.shader = lent;
+    if (shader) |lent| {
+        mat.shader = lent;
+        // Told per draw, because it is a fact about this material and the shader is
+        // shared by every mesh in the world.
+        if (normal_flag >= 0) {
+            const has: c_int = if (made.normal != null) 1 else 0;
+            rl.SetShaderValue(lent, normal_flag, &has, rl.SHADER_UNIFORM_INT);
+        }
+    }
     const look = struct {
         fn up(ts: ?*const Textures, id: ?TextureId, blank: rl.Texture2D) rl.Texture2D {
             const which = id orelse return blank;

@@ -80,6 +80,30 @@ fn furnish(
     });
     module.linkLibrary(raylib.artifact("raylib"));
 
+    // raylib's C is compiled without the undefined-behaviour sanitizer, which zig
+    // would otherwise switch on for it in debug and ReleaseSafe.
+    //
+    // Not because upstream C is noisy in general: because of one bug, which makes a
+    // debug build abort on ordinary hardware. GLFW takes any /dev/input/event* that
+    // advertises an absolute axis to be a joystick, and a great many keyboards — QMK
+    // and ZMK boards, and shop-bought ones with a volume knob — put that axis on the
+    // same node as the keys. GLFW then reads key presses off it as if they were
+    // gamepad buttons:
+    //
+    //     js->linjs.keyMap[code - BTN_MISC]
+    //
+    // BTN_MISC is 256 and a letter key is well under it, so the index is negative, and
+    // the sanitizer stops the program on the spot. It happens to land inside the
+    // 4096-byte `path` field that was zeroed when the device was opened, so the value
+    // read is 0 and button 0 is what gets set: harmless, and why a release build has
+    // always got away with it while `zig build run` died on every keystroke.
+    //
+    // linux_joystick.c is #included into raylib's amalgamated rglfw.c, so it cannot be
+    // patched or swapped from out here, and no build flag turns the linux joystick
+    // backend off. Switching the sanitizer off for raylib alone is the smallest thing
+    // that works, and our own zig keeps every check it had.
+    raylib.artifact("raylib").root_module.sanitize_c = .off;
+
     // box3d's headers, reached as "box3d/x.h".
     module.addIncludePath(b.path("include/"));
     module.addOptions("build_options", options);

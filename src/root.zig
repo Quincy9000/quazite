@@ -49,6 +49,7 @@ pub const Store = @import("store.zig").Store;
 
 pub const input = @import("input.zig");
 pub const noise = @import("noise.zig");
+pub const polygon = @import("polygon.zig");
 pub const tween = @import("tween.zig");
 
 // ---- the modules: their types at the top, their `Module(Spec)` for the rest ----

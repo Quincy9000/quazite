@@ -28,6 +28,7 @@ comptime {
     _ = @import("store.zig");
     _ = @import("input.zig");
     _ = @import("noise.zig");
+    _ = @import("polygon.zig");
     _ = @import("tween.zig");
     _ = @import("mesh.zig");
     _ = fw.clock;

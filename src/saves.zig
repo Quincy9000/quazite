@@ -82,6 +82,7 @@ pub fn Module(comptime Spec: type) type {
         /// the game picks up where it left off — and a restart goes back to the last save
         /// rather than to a new world. No save, and the fresh world simply stands.
         pub fn pickUp(w: *W) void {
+            if (!config.pick_up) return;
             if (!rl.FileExists(config.save_path)) return;
             load(w);
         }

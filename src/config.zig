@@ -149,6 +149,17 @@ pub const Config = struct {
     // ---- the save ----
 
     save_path: [*:0]const u8 = "save.bin",
+    /// Whether every start loads `save_path`, if it is there.
+    ///
+    /// On, and the world goes on from where it left off, which is what a game wants: shut
+    /// it, open it, and there you are.
+    ///
+    /// Off, and a start is a fresh world every time. What a tool wants, where the file
+    /// somebody opens is the one they meant to open — an editor picking a file up on its
+    /// own has decided which of a folder full of them you are working on, and it is nearly
+    /// always the wrong guess. Saving and loading by name go on working; only the guess at
+    /// the start goes away.
+    pick_up: bool = true,
     /// Seconds the word "saved" or "loaded" stays up.
     notice_time: f32 = 2.5,
 

@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const rl = @import("raylib.zig").c;
+const config_module = @import("config.zig");
 
 const identity = rl.Quaternion{ .x = 0, .y = 0, .z = 0, .w = 1 };
 
@@ -1024,6 +1025,10 @@ pub const Textures = struct {
     gpa: std.mem.Allocator,
     list: std.ArrayList(Kept) = .empty,
     by_name: std.StringHashMapUnmanaged(TextureId) = .empty,
+    /// How a picture loaded from here on is sampled. Set from the game's config when the
+    /// resource is made; see `Sampling`.
+    sampling: config_module.Sampling = .smooth,
+    anisotropy: c_int = 16,
 
     /// One picture from a file, under its own file name without the extension. Loading
     /// a name that is already here gives back the one that is here: a folder read twice
@@ -1041,16 +1046,29 @@ pub const Textures = struct {
             // picture without knowing anything happened.
             if (ts.list.items[had].texture.id != 0) return had;
         }
-        const texture = rl.LoadTexture(path);
+        var texture = rl.LoadTexture(path);
         if (texture.id == 0) {
             if (already == null) ts.gpa.free(label);
             return error.TextureNotLoaded;
         }
-        // A wall wants to repeat, and to be smoothed between its own texels and nothing
-        // else. No mip levels are made: raylib's bilinear on a mipmapped texture is
-        // LINEAR_MIP_NEAREST, which still blends between levels and still reads soft —
-        // plain bilinear is only plain when there is nothing to mip to.
-        rl.SetTextureFilter(texture, rl.TEXTURE_FILTER_BILINEAR);
+        // A wall wants to repeat, and to be sampled the way the game asked for.
+        switch (ts.sampling) {
+            // Smoothed between its own texels and nothing else. No mip levels are made:
+            // raylib's bilinear on a mipmapped texture is LINEAR_MIP_NEAREST, which still
+            // blends between levels and still reads soft — plain bilinear is only plain
+            // when there is nothing to mip to.
+            .smooth => rl.SetTextureFilter(texture, rl.TEXTURE_FILTER_BILINEAR),
+            // Nearest across a level, linear between them, anisotropy over the lot. Done
+            // here rather than left to the game, so `made.mipmaps` is the count there
+            // really is: `GenTextureMipmaps` writes it, and a copy taken before the call
+            // would say one for ever.
+            .crisp => {
+                rl.GenTextureMipmaps(&texture);
+                rl.rlTextureParameters(texture.id, rl.RL_TEXTURE_MAG_FILTER, rl.RL_TEXTURE_FILTER_NEAREST);
+                rl.rlTextureParameters(texture.id, rl.RL_TEXTURE_MIN_FILTER, rl.RL_TEXTURE_FILTER_NEAREST_MIP_LINEAR);
+                rl.rlTextureParameters(texture.id, rl.RL_TEXTURE_FILTER_ANISOTROPIC, ts.anisotropy);
+            },
+        }
         rl.SetTextureWrap(texture, rl.TEXTURE_WRAP_REPEAT);
         if (already) |had| {
             ts.list.items[had].texture = texture;
@@ -1126,10 +1144,27 @@ pub const Textures = struct {
     /// One rule covers all of them, which is better than a list of names to keep
     /// guessing at.
     pub fn loadUnder(ts: *Textures, root: [*:0]const u8) usize {
-        return ts.walkUnder(root, 0);
+        return ts.loadUnderBut(root, &.{});
     }
 
-    fn walkUnder(ts: *Textures, root: [*:0]const u8, depth: u8) usize {
+    /// The same, leaving alone any folder whose name is in `skip`, as well as the hidden
+    /// ones it already leaves alone.
+    ///
+    /// A project holds folders full of images that are not the game's: a build's own
+    /// output, a package cache, somebody else's checkout unpacked inside it. Walking them
+    /// is slow, and what it finds is worse than useless — three hundred of a dependency's
+    /// example pictures in the list, one of which has quietly claimed the name the game
+    /// wanted for its own.
+    ///
+    /// Named rather than read out of `.gitignore`, tempting as that looks. A project may
+    /// well ignore its own picture folder on purpose — a texture pack is somebody else's
+    /// work, licensed, and far too large to commit — and a walk obeying it would then find
+    /// nothing at all.
+    pub fn loadUnderBut(ts: *Textures, root: [*:0]const u8, skip: []const []const u8) usize {
+        return ts.walkUnder(root, 0, skip);
+    }
+
+    fn walkUnder(ts: *Textures, root: [*:0]const u8, depth: u8, skip: []const []const u8) usize {
         if (depth > walk_deepest) return 0;
         if (!rl.DirectoryExists(root)) return 0;
         // The loose ones lying here first, so a name near the top beats the same name
@@ -1143,7 +1178,12 @@ pub const Textures = struct {
             // Points into the path itself, which lives as long as the list does.
             const name = std.mem.span(rl.GetFileName(path));
             if (name.len == 0 or name[0] == '.') continue;
-            added += ts.walkUnder(path, depth + 1);
+            var passed = false;
+            for (skip) |leave| {
+                if (std.mem.eql(u8, name, leave)) passed = true;
+            }
+            if (passed) continue;
+            added += ts.walkUnder(path, depth + 1, skip);
         }
         return added;
     }
@@ -1272,7 +1312,11 @@ pub fn Module(comptime Spec: type) type {
 
         pub fn plugin(w: *W, allocator: std.mem.Allocator) !void {
             _ = try w.insertResource(allocator, Meshes{ .gpa = allocator });
-            _ = try w.insertResource(allocator, Textures{ .gpa = allocator });
+            _ = try w.insertResource(allocator, Textures{
+                .gpa = allocator,
+                .sampling = config.sampling,
+                .anisotropy = config.anisotropy,
+            });
             _ = try w.insertResource(allocator, Materials{ .gpa = allocator });
             default_light = config.mesh_light;
             default_ambient = config.mesh_ambient;

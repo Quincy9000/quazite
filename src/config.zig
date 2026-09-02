@@ -10,6 +10,25 @@ const rl = @import("raylib.zig").c;
 /// thing; everything else is the same either way.
 pub const View = enum { two, three };
 
+/// How a picture is sampled when it is drawn.
+pub const Sampling = enum {
+    /// Smoothed between its own texels, with no mip levels under it. What a game drawing
+    /// a sprite or a wall at a size it chose wants.
+    smooth,
+    /// Texels kept square when magnified, mip levels under them, anisotropy on top.
+    ///
+    /// What a tool wants, and what a game wants for pixel art. A wall seen from across a
+    /// room samples one texel in a dozen and crawls as the eye moves; mip levels are what
+    /// stop that, and anisotropy is what keeps a floor from going to mush at a grazing
+    /// angle, which is most of what is looked at. Nearest across a level keeps a texel a
+    /// square, which is the whole point of drawing one.
+    ///
+    /// It is set through rlgl rather than raylib's `SetTextureFilter`, whose filters are a
+    /// fixed menu and do not include this pairing: POINT turns mipmapping off again, and
+    /// BILINEAR and TRILINEAR both smear the texels the picture is there to show.
+    crisp,
+};
+
 pub const Config = struct {
     view: View = .three,
 
@@ -29,6 +48,29 @@ pub const Config = struct {
     near_plane: f32 = 0.1,
     far_plane: f32 = 1000,
     sky: rl.Color = .{ .r = 24, .g = 28, .b = 36, .a = 255 },
+    // ---- the pictures ----
+
+    /// How every picture is sampled. See `Sampling`.
+    sampling: Sampling = .smooth,
+    /// How far anisotropy is taken, where `sampling` is `.crisp`. Sixteen is the most any
+    /// card in use offers and the cost of it is nothing worth measuring.
+    anisotropy: c_int = 16,
+
+    /// Whether the frame waits for the display before it is shown.
+    ///
+    /// On, and the game runs at whatever the monitor is set to and never draws a frame
+    /// nobody sees. Off, and the frame rate says how fast the thing being made actually
+    /// draws — which is what a tool wants, and exactly what waiting hides: with it on, a
+    /// debug build and a fast one report the same number and neither number is about the
+    /// game. The price is tearing, and frames drawn that the display never shows.
+    vsync: bool = true,
+    /// The most frames a second to draw, or nought for as many as the card will give.
+    ///
+    /// Worth setting when `vsync` is off: uncapped, a small scene runs the card flat out
+    /// drawing thousands of frames a second that nobody will ever see, for a fan that
+    /// never settles. A cap well above any display leaves the number meaning something
+    /// and the machine quiet.
+    frame_cap: c_int = 0,
     /// The key that closes the window: raylib's Escape. `rl.KEY_NULL` for a game that
     /// leaves some other way — a menu, or an editor that wants Escape for itself.
     exit_key: c_int = rl.KEY_ESCAPE,

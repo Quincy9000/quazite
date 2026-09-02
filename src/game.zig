@@ -41,12 +41,14 @@ pub fn Module(comptime Spec: type) type {
         fn openWindow(_: *W) void {
             // Asked for before the window exists, which is the only time it can be: the
             // edges of everything smoothed by the samples, not the shader.
-            const flags: c_uint = rl.FLAG_MSAA_4X_HINT | rl.FLAG_VSYNC_HINT |
+            const flags: c_uint = rl.FLAG_MSAA_4X_HINT |
+                @as(c_uint, if (config.vsync) rl.FLAG_VSYNC_HINT else 0) |
                 @as(c_uint, if (config.window_resizable) rl.FLAG_WINDOW_RESIZABLE else 0);
             rl.SetConfigFlags(flags);
             rl.InitWindow(config.window_width, config.window_height, config.game_title);
             if (config.window_resizable) rl.SetWindowMinSize(config.window_min_width, config.window_min_height);
             rl.rlSetClipPlanes(config.near_plane, config.far_plane);
+            if (config.frame_cap > 0) rl.SetTargetFPS(config.frame_cap);
             // Escape closes the window. A game with a menu of its own takes the key back with
             // KEY_NULL and leaves through the menu instead.
             rl.SetExitKey(config.exit_key);

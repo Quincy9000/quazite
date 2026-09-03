@@ -1030,13 +1030,15 @@ pub const Textures = struct {
     sampling: config_module.Sampling = .smooth,
     anisotropy: c_int = 16,
 
-    /// One picture from a file, under its own file name without the extension. Loading
-    /// a name that is already here gives back the one that is here: a folder read twice
-    /// does not double.
+    /// One picture from a file, under its path without the extension — `walls/brick`
+    /// for `./walls/brick.png`. Loading a path that is already here gives back the one
+    /// that is here: a folder read twice does not double.
+    ///
+    /// The path and not the bare file name, because a pack is six folders of the same
+    /// thirteen names in six colours, and by the bare name five of the six were quietly
+    /// the first one. See `labelOf` for what is kept of the path.
     pub fn load(ts: *Textures, path: [*:0]const u8) !TextureId {
-        // raylib hands this back out of a static buffer it wipes on the next call, so
-        // it is taken a copy of at once rather than held on to across the loading.
-        const label = try ts.gpa.dupe(u8, std.mem.span(rl.GetFileNameWithoutExt(path)));
+        const label = try labelOf(ts.gpa, std.mem.span(path));
         errdefer ts.gpa.free(label);
         const already = ts.by_name.get(label);
         if (already) |had| {
@@ -1080,6 +1082,31 @@ pub const Textures = struct {
         return id;
     }
 
+    /// What a picture at a path is called: the path with the extension off, any leading
+    /// `./` off, and every backslash a slash, so the same file is called the same thing
+    /// whichever way the walk that found it spelled the path. Owned by the caller.
+    pub fn labelOf(gpa: std.mem.Allocator, path: []const u8) ![]u8 {
+        var from: usize = 0;
+        while (from + 1 < path.len and path[from] == '.' and (path[from + 1] == '/' or path[from + 1] == '\\')) from += 2;
+        var to = path.len;
+        // The extension is the last dot in the last component — a folder called `v1.2`
+        // is not an extension.
+        var i = path.len;
+        while (i > from) : (i -= 1) {
+            const c = path[i - 1];
+            if (c == '/' or c == '\\') break;
+            if (c == '.') {
+                to = i - 1;
+                break;
+            }
+        }
+        const label = try gpa.dupe(u8, path[from..to]);
+        for (label) |*c| {
+            if (c.* == '\\') c.* = '/';
+        }
+        return label;
+    }
+
     /// An id for a name whose file is not here — yet, or at all.
     ///
     /// A level names its pictures, because a number is a place in a folder and the folder
@@ -1108,8 +1135,8 @@ pub const Textures = struct {
     /// way down. How many were loaded. A folder that is not there is none of them, which
     /// is not an error: a game may simply have no pictures yet.
     ///
-    /// A name already loaded is not loaded twice, so several folders may be scanned one
-    /// after another and whichever is scanned first wins the name.
+    /// A path already loaded is not loaded twice, so several folders may be scanned one
+    /// after another without doubling anything.
     ///
     /// A whole project tree is a fine thing to point this at. Walking a few thousand
     /// entries that are not pictures costs nothing worth measuring, and picking out the
@@ -1167,8 +1194,7 @@ pub const Textures = struct {
     fn walkUnder(ts: *Textures, root: [*:0]const u8, depth: u8, skip: []const []const u8) usize {
         if (depth > walk_deepest) return 0;
         if (!rl.DirectoryExists(root)) return 0;
-        // The loose ones lying here first, so a name near the top beats the same name
-        // buried deeper.
+        // The loose ones lying here first, then each folder under here.
         var added = ts.loadFolder(root, false);
         const folders = rl.LoadDirectoryFilesEx(root, "DIRS*", false);
         defer rl.UnloadDirectoryFiles(folders);
@@ -1188,8 +1214,26 @@ pub const Textures = struct {
         return added;
     }
 
+    /// A picture by name: the whole path as `load` names it, or the tail of one — the
+    /// bare file name, or the last folder and the file name. A level written before
+    /// pictures were named by their paths says `brick`, and `walls/brick` is what there
+    /// is; and a game asking for `brick` should not have to know which folder it lies
+    /// in. Where a tail fits more than one, the first loaded answers, which is what the
+    /// bare name used to mean anyway.
     pub fn find(ts: *const Textures, label: []const u8) ?TextureId {
-        return ts.by_name.get(label);
+        if (ts.by_name.get(label)) |had| return had;
+        if (label.len == 0) return null;
+        for (ts.list.items, 0..) |kept, id| {
+            if (endsWithComponent(kept.name, label)) return @intCast(id);
+        }
+        return null;
+    }
+
+    /// Whether `tail` is the whole of `name`, or the end of it on a folder boundary.
+    fn endsWithComponent(name: []const u8, tail: []const u8) bool {
+        if (name.len < tail.len) return false;
+        if (!std.mem.endsWith(u8, name, tail)) return false;
+        return name.len == tail.len or name[name.len - tail.len - 1] == '/';
     }
 
     /// A picture by id. An id nothing answers to gives the check rather than nothing:
@@ -1505,6 +1549,37 @@ test "a mesh let go of hands its slot back" {
     try std.testing.expect(f != e);
     try std.testing.expectEqual(@as(usize, 4), ms.list.items.len);
     _ = c;
+}
+
+test "a picture is named by its path, cleaned up, and found by the tail of it" {
+    const gpa = std.testing.allocator;
+    const cases = [_][2][]const u8{
+        .{ "./textures/proto/Dark/texture_01.png", "textures/proto/Dark/texture_01" },
+        .{ ".\\textures\\proto\\Green\\texture_01.PNG", "textures/proto/Green/texture_01" },
+        .{ "wall.png", "wall" },
+        .{ "packs/v1.2/floor.tile.jpg", "packs/v1.2/floor.tile" },
+        .{ "packs/v1.2/floor", "packs/v1.2/floor" },
+    };
+    for (cases) |case| {
+        const label = try Textures.labelOf(gpa, case[0]);
+        defer gpa.free(label);
+        try std.testing.expectEqualStrings(case[1], label);
+    }
+
+    var ts = Textures{ .gpa = gpa };
+    defer ts.unloadAll();
+    const dark = try ts.reserve("textures/proto/Dark/texture_01");
+    const green = try ts.reserve("textures/proto/Green/texture_01");
+    const other = try ts.reserve("textures/proto/Green/texture_02");
+    // The whole path is exact; a tail on a folder boundary finds the first that fits;
+    // a tail that cuts into a name is no name at all.
+    try std.testing.expectEqual(green, ts.find("textures/proto/Green/texture_01").?);
+    try std.testing.expectEqual(dark, ts.find("texture_01").?);
+    try std.testing.expectEqual(green, ts.find("Green/texture_01").?);
+    try std.testing.expectEqual(other, ts.find("texture_02").?);
+    try std.testing.expect(ts.find("exture_01") == null);
+    try std.testing.expect(ts.find("") == null);
+    try std.testing.expect(ts.find("Blue/texture_01") == null);
 }
 
 test "a named mesh keeps its slot even when it is let go of" {

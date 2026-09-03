@@ -1107,6 +1107,28 @@ pub const Textures = struct {
         return label;
     }
 
+    /// A picture already on the card taken in under a name: one that came in with a
+    /// model, say, which raylib loaded on the model's behalf. It is the list's from here
+    /// on and is unloaded with the rest, so whoever loaded it must not unload it again.
+    /// A name already here gives back the one that is here, and the picture handed in
+    /// is unloaded, since nothing will ever draw it.
+    pub fn adopt(ts: *Textures, name: []const u8, texture: rl.Texture2D) !TextureId {
+        if (ts.by_name.get(name)) |had| {
+            if (ts.list.items[had].texture.id == 0) {
+                ts.list.items[had].texture = texture;
+            } else if (texture.id != ts.list.items[had].texture.id) {
+                rl.UnloadTexture(texture);
+            }
+            return had;
+        }
+        const label = try ts.gpa.dupe(u8, name);
+        errdefer ts.gpa.free(label);
+        try ts.list.append(ts.gpa, .{ .name = label, .texture = texture });
+        const id: TextureId = @intCast(ts.list.items.len - 1);
+        try ts.by_name.put(ts.gpa, label, id);
+        return id;
+    }
+
     /// An id for a name whose file is not here — yet, or at all.
     ///
     /// A level names its pictures, because a number is a place in a folder and the folder

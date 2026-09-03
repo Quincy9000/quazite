@@ -48,6 +48,7 @@ pub const Store = @import("store.zig").Store;
 // ---- the toolkit that needs no spec ----
 
 pub const input = @import("input.zig");
+pub const hud = @import("hud.zig");
 pub const noise = @import("noise.zig");
 pub const polygon = @import("polygon.zig");
 pub const tween = @import("tween.zig");

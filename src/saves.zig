@@ -5,6 +5,7 @@
 
 const std = @import("std");
 const rl = @import("raylib.zig").c;
+const hud = @import("hud.zig");
 const input = @import("input.zig");
 const Clock = @import("clock.zig").Clock;
 
@@ -104,8 +105,8 @@ pub fn Module(comptime Spec: type) type {
         /// A word at the top of the screen for a moment after a save or a load.
         pub fn draw(_: *W) void {
             if (notice_left <= 0) return;
-            const wide = rl.MeasureText(&notice, config.hud_text_size);
-            rl.DrawText(
+            const wide = hud.measureText(&notice, config.hud_text_size);
+            hud.drawText(
                 &notice,
                 @divFloor(rl.GetScreenWidth() - wide, 2),
                 config.hud_margin + 40,

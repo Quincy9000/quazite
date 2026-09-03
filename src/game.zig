@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const rl = @import("raylib.zig").c;
+const hud = @import("hud.zig");
 const input = @import("input.zig");
 const Clock = @import("clock.zig").Clock;
 
@@ -119,11 +120,11 @@ pub fn Module(comptime Spec: type) type {
             var line_top: c_int = config.hud_margin;
             var text: [64]u8 = undefined;
             const head = std.fmt.bufPrintZ(&text, "updates {d:.2} ms", .{total}) catch "";
-            rl.DrawText(head.ptr, right - rl.MeasureText(head.ptr, size), line_top, size, rl.RAYWHITE);
+            hud.drawText(head.ptr, right - hud.measureText(head.ptr, size), line_top, size, rl.RAYWHITE);
             line_top += size + 4;
             for (top[zero..shown]) |row| {
                 const line = std.fmt.bufPrintZ(&text, "{s}  {d:.2}", .{ row.name, row.ms }) catch "";
-                rl.DrawText(line.ptr, right - rl.MeasureText(line.ptr, size), line_top, size, rl.RAYWHITE);
+                hud.drawText(line.ptr, right - hud.measureText(line.ptr, size), line_top, size, rl.RAYWHITE);
                 line_top += size + 4;
             }
         }
@@ -170,7 +171,7 @@ pub fn Module(comptime Spec: type) type {
                 w.resource(Clock).elapsed,
                 @as([]const u8, if (input.padPlugged()) "pad" else "keyboard"),
             }) catch "";
-            rl.DrawText(line.ptr, config.hud_margin, config.hud_margin, size, rl.RAYWHITE);
+            hud.drawText(line.ptr, config.hud_margin, config.hud_margin, size, rl.RAYWHITE);
             const hint: [:0]const u8 = switch (config.view) {
                 .three => if (input.padPlugged())
                     "sticks  fly + look   bumpers  down / up"
@@ -181,7 +182,7 @@ pub fn Module(comptime Spec: type) type {
                 else
                     "wasd  pan   wheel / - =  zoom   right drag  haul   f5  save   f9  load   r  restart   p  profile   esc  quit",
             };
-            if (config.hud_hint) rl.DrawText(hint.ptr, config.hud_margin, rl.GetScreenHeight() - config.hud_margin - size, size, config.hud_dim);
+            if (config.hud_hint) hud.drawText(hint.ptr, config.hud_margin, rl.GetScreenHeight() - config.hud_margin - size, size, config.hud_dim);
         }
 
         fn endFrame(_: *W) void {
